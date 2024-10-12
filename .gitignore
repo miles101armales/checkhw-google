@@ -16,6 +16,7 @@ lerna-debug.log*
 .DS_Store
 
 credentials.json
+updated_cells.txt
 
 # Tests
 /coverage

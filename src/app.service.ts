@@ -1,96 +1,103 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { google, sheets_v4 } from 'googleapis';
-import path from 'path';
 import * as fs from 'fs';
 import { UpdateStatusDto } from './dto/update-hw.dto';
+import { emailColumnMap } from './emailColumnMap';
+import { Interval } from '@nestjs/schedule';
 
-// Маппинг между номером домашнего задания и столбцом
+interface CellUpdate {
+  range: string;
+  values: any[][];
+}
+
 const assignmentColumnMap: Record<number, string> = {
-  1: 'J',
-  2: 'K',
-  3: 'L',
-  4: 'M',
-  5: 'N',
-  6: 'O',
-  7: 'P',
-  8: 'Q',
-  9: 'R',
-  10: 'S',
-  11: 'T',
-  12: 'U',
-  13: 'V',
-  14: 'W',
-  15: 'X',
-  16: 'Y',
-  17: 'Z',
-  18: 'AA',
+  1: 'I', 2: 'J', 3: 'K', 4: 'L', 5: 'M', 6: 'N', 7: 'O', 8: 'P', 9: 'Q', 10: 'R',
+  11: 'S', 12: 'T', 13: 'U', 14: 'V', 15: 'W', 16: 'X', 17: 'Y', 18: 'Z', 19: 'AA',
 };
 
 @Injectable()
-export class AppService {
+export class AppService implements OnModuleInit {
   private sheets: sheets_v4.Sheets;
-  private spreadsheetId = '1RTbBj4QhR1hK_M9NOJigZyYJqpUoNSNy1huzouhT-Yk'; // Укажите свой ID таблицы
+  private spreadsheetId = '1RTbBj4QhR1hK_M9NOJigZyYJqpUoNSNy1huzouhT-Yk';
+  private updateBatch: CellUpdate[] = [];
+  private logFilePath = 'updated_cells.txt';
 
   constructor() {
     const auth = this.authenticate();
     this.sheets = google.sheets({ version: 'v4', auth });
   }
 
-  // Метод для аутентификации через OAuth2
-  private authenticate() {
-    const credentials = JSON.parse(
-      fs.readFileSync('credentials.json', 'utf-8'),
-    );
-
-    // Создаем клиента с использованием ключей сервисного аккаунта
-    const oAuth2Client = new google.auth.JWT({
-      email: credentials.client_email,
-      key: credentials.private_key,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'], // Доступ к Google Sheets API
-    });
-
-    return oAuth2Client;
+  onModuleInit() {
+    this.scheduleBatchUpdate();
   }
 
-  // Основной метод для обновления статуса домашнего задания
+  private authenticate() {
+    const credentials = JSON.parse(fs.readFileSync('credentials.json', 'utf-8'));
+    return new google.auth.JWT({
+      email: credentials.client_email,
+      key: credentials.private_key,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+  }
+
   async updateAssignmentStatus(dto: UpdateStatusDto): Promise<void> {
     const { email, assignmentNumber, status } = dto;
-
-    const range = 'Выполнение ДЗ!A2:AA530'; // Диапазон данных, который нужно просканировать
-
-    // Шаг 1: Получаем данные с Google Sheets
-    const response = await this.sheets.spreadsheets.values.get({
-      spreadsheetId: this.spreadsheetId,
-      range,
-    });
-
-    console.log(email);
-
-    const rows = response.data.values;
-    if (!rows) throw new Error('Нет данных в таблице');
-
-    // Шаг 2: Находим строку с нужным email
-    const rowIndex = rows.findIndex((row) => {
-      return row[2] == email;
-    });
-    if (rowIndex === -1) throw new Error('Почта не найдена');
-
-    console.log(rowIndex);
-
-    // Шаг 3: Обновляем статус домашнего задания
+  
+    // Приводим email к нижнему регистру
+    const lowerCaseEmail = email.toLowerCase();
+  
+    const rowNumber = Object.entries(emailColumnMap).find(([_, e]) => e.toLowerCase() === lowerCaseEmail)?.[0];
+    if (!rowNumber) throw new Error('Почта не найдена');
+  
     const column = assignmentColumnMap[assignmentNumber];
     if (!column) throw new Error('Неверный номер домашнего задания');
+  
+    const cell = `${column}${rowNumber}`;
+    
+    this.addToBatch(`Выполнение ДЗ!${cell}`, [[status]]);
+    this.logUpdatedCell(cell, status);
+  
+    if (this.updateBatch.length >= 500) {
+      await this.executeBatchUpdate();
+    }
+  }
 
-    const cell = `${column}${rowIndex + 2}`; // Пример: B2, C5 и т.д.
-    console.log(cell);
+  private addToBatch(range: string, values: any[][]) {
+    this.updateBatch.push({ range, values });
+  }
 
-    await this.sheets.spreadsheets.values.update({
-      spreadsheetId: this.spreadsheetId,
-      range: `Выполнение ДЗ!${cell}`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [[status]],
-      },
-    });
+  private logUpdatedCell(cell: string, status: string) {
+    const logMessage = `${new Date().toISOString()} - Updated cell: ${cell}, New status: ${status}\n`;
+    fs.appendFileSync(this.logFilePath, logMessage);
+  }
+
+  @Interval(300000) // 5 минут
+  private async scheduleBatchUpdate() {
+    if (this.updateBatch.length > 0) {
+      await this.executeBatchUpdate();
+    }
+  }
+
+  private async executeBatchUpdate() {
+    try {
+      const result = await this.sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: this.spreadsheetId,
+        requestBody: {
+          valueInputOption: 'RAW',
+          data: this.updateBatch,
+        },
+      });
+      console.log(`Batch update completed: ${result.statusText}`);
+      this.logBatchUpdate();
+      this.updateBatch = []; // Очищаем пакет после обновления
+    } catch (error) {
+      console.error('Error executing batch update:', error);
+    }
+  }
+
+  private logBatchUpdate() {
+    const logMessage = `${new Date().toISOString()} - Batch update executed. Updated cells:\n`;
+    const cellsUpdated = this.updateBatch.map(update => update.range).join(', ');
+    fs.appendFileSync(this.logFilePath, logMessage + cellsUpdated + '\n\n');
   }
 }
